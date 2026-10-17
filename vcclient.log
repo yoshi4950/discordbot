@@ -1,0 +1,5 @@
+2025-08-17 05:09:36,065 - vcclient - DEBUG - 36692 - ---------------- Booting PHASE :__main__ -----------------
+2025-08-17 05:09:36,066 - vcclient - INFO - 36692 -     Booting PHASE :__main__
+2025-08-17 05:09:36,066 - vcclient - DEBUG - 36692 - Namespace(logLevel='error', p=18888, https=False, test_connect='8.8.8.8', httpsKey='ssl.key', httpsCert='ssl.cert', httpsSelfSigned=True, model_dir='model_dir', sample_mode='production', content_vec_500='pretrain/checkpoint_best_legacy_500.pt', content_vec_500_onnx='pretrain/content_vec_500.onnx', content_vec_500_onnx_on=True, hubert_base='pretrain/hubert_base.pt', hubert_base_jp='pretrain/rinna_hubert_base_jp.pt', hubert_soft='pretrain/hubert/hubert-soft-0d54a1f4.pt', nsf_hifigan='pretrain/nsf_hifigan/model', crepe_onnx_full='pretrain/crepe_onnx_full.onnx', crepe_onnx_tiny='pretrain/crepe_onnx_tiny.onnx', rmvpe='pretrain/rmvpe.pt', rmvpe_onnx='pretrain/rmvpe.onnx')
+2025-08-17 05:09:36,066 - vcclient - INFO - 36692 -     PYTHON:3.10.11 (tags/v3.10.11:7d4cc5a, Apr  5 2023, 00:38:17) [MSC v.1929 64 bit (AMD64)]
+2025-08-17 05:09:36,066 - vcclient - INFO - 36692 -     Activating the Voice Changer.
