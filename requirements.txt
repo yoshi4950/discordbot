@@ -1,0 +1,7 @@
+discord.py>=2.4.0
+python-dotenv>=1.0.0
+google-generativeai>=0.3.0
+aiohttp
+Flask
+google-cloud-firestore>=2.13.0
+google-auth>=2.0.0
