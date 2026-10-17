@@ -436,11 +436,16 @@ class TagToggleButton(discord.ui.Button):
         registered = role_id in parent.owned_role_ids
         if parent.mode == "update":
             prefix = ("解除: " if selected else "登録済: ") if registered else ("追加: " if selected else "未登録: ")
+            # 登録済みは緑、登録解除を選択中は赤、未登録は灰色で区別する。
+            style = (discord.ButtonStyle.danger if selected else discord.ButtonStyle.success) if registered else (
+                discord.ButtonStyle.success if selected else discord.ButtonStyle.secondary
+            )
         else:
             prefix = "✓ " if selected else "＋ "
+            style = discord.ButtonStyle.success if selected else discord.ButtonStyle.secondary
         super().__init__(
             label=prefix + tag["tag_name"][:max(1, 80 - len(prefix))],
-            style=discord.ButtonStyle.success if selected else discord.ButtonStyle.secondary,
+            style=style,
             row=index // 5,
         )
 
@@ -457,7 +462,7 @@ class TagCategoryHeader(discord.ui.Button):
 class TagChoiceView(discord.ui.View):
     """個人のタグ追加・更新用。ボタンをページ分割してDiscordの上限内に収める。"""
 
-    # 操作行（ページ選択・カテゴリ・確定）を確保するため、タグは1ページ10件にする。
+    # 操作行（ページ選択・確定）を確保するため、タグは1ページ10件にする。
     PAGE_SIZE = 10
 
     def __init__(self, cog: "GameSchedule", tags: list[dict], mode: str, owned_role_ids: set[int]) -> None:
@@ -1405,6 +1410,7 @@ class GameSchedule(commands.Cog):
         owned_app_ids = {str(game.get("appid")) for game in games}
         additions = 0
         failures = 0
+        unmatched_visible_tags: list[str] = []
         for tag in tags:
             role_id = int(tag.get("role_id") or 0)
             role = interaction.guild.get_role(role_id) if role_id else None
@@ -1416,10 +1422,16 @@ class GameSchedule(commands.Cog):
                     failures += 1
                     print(f"[GameSchedule] 表示Steamタグのロール準備失敗: tag={tag.get('tag_name')}, error={type(exc).__name__}: {exc}")
                     continue
-            if tag.get("app_id") is not None:
-                owns = str(tag["app_id"]) in owned_app_ids
-            else:
-                owns = bool(tag.get("match_keyword")) and any(tag["match_keyword"].casefold() in name for name in owned_names)
+            # app_idを優先しつつ、古い/誤ったapp_idで取りこぼさないようSteam名・照合語も確認。
+            match_terms = [str(tag.get(field) or "").strip().casefold()
+                           for field in ("match_keyword", "steam_game_name", "tag_name")]
+            match_terms = [term for term in dict.fromkeys(match_terms) if len(term) >= 3]
+            owns = (
+                (tag.get("app_id") is not None and str(tag["app_id"]) in owned_app_ids)
+                or any(term in name for term in match_terms for name in owned_names)
+            )
+            if not owns:
+                unmatched_visible_tags.append(str(tag.get("tag_name") or tag.get("steam_game_name") or "不明"))
             try:
                 if owns and role not in member.roles:
                     await member.add_roles(role, reason="Steam所持ゲーム同期")
@@ -1429,6 +1441,8 @@ class GameSchedule(commands.Cog):
             except discord.HTTPException as exc:
                 failures += 1
                 print(f"[GameSchedule] Steamロール同期失敗: user_id={member.id}, tag={tag.get('tag_name')}, role_id={role.id}, error={exc}")
+        if unmatched_visible_tags:
+            print("[GameSchedule] 所持ゲームと一致しなかった表示タグ: " + ", ".join(unmatched_visible_tags[:30]))
         return len(games), additions, failures
 
     @app_commands.command(name="sync", description="Steam所持ゲームとゲームロールを同期")

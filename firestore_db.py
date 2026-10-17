@@ -1,10 +1,10 @@
 import os
 import json
-import tempfile
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 from google.cloud import firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
+from google.oauth2 import service_account
 import asyncio
 from functools import wraps
 
@@ -21,28 +21,43 @@ class FirestoreDatabase:
         
         print(f"[Firestore] 使用プロジェクトID: {self.project_id}")
         
-        # Koyeb用: JSON文字列からサービスアカウントキーファイルを作成
-        if self.credentials_json and not self.credentials_path:
-            try:
-                # 一時ファイルにJSONを書き込み
-                with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as temp_file:
-                    temp_file.write(self.credentials_json)
-                    self.credentials_path = temp_file.name
-                    os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = self.credentials_path
-            except Exception as e:
-                print(f"サービスアカウントキー作成エラー: {e}")
-        
-        # Firestoreクライアント初期化
-        elif self.credentials_path:
-            os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = self.credentials_path
-        
-        # データベースIDをデフォルトに設定
+        # KoyebなどではサービスアカウントJSONを環境変数から直接読み込む。
+        # ローカルではJSON環境変数、認証ファイル、ADCの順で既存設定を利用する。
         try:
-            self.db = firestore.Client(project=self.project_id)
+            if self.credentials_json:
+                try:
+                    credentials_info = json.loads(self.credentials_json)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        "GOOGLE_APPLICATION_CREDENTIALS_JSONをJSONとして読み取れません。"
+                        "Koyebの環境変数にはサービスアカウントJSON全体を設定してください。"
+                    ) from exc
+                credentials = service_account.Credentials.from_service_account_info(
+                    credentials_info
+                )
+                self.db = firestore.Client(
+                    project=self.project_id,
+                    credentials=credentials,
+                )
+            elif self.credentials_path:
+                credentials = service_account.Credentials.from_service_account_file(
+                    self.credentials_path
+                )
+                self.db = firestore.Client(
+                    project=self.project_id,
+                    credentials=credentials,
+                )
+            else:
+                # Cloud Run等の実行環境やgcloud ADCを利用する場合
+                self.db = firestore.Client(project=self.project_id)
             print(f"[Firestore] クライアント初期化成功 (データベース: default)")
         except Exception as e:
-            print(f"[Firestore] クライアント初期化失敗: {e}")
-            raise
+            # 認証JSONや秘密鍵そのものをログへ出さない。
+            print(f"[Firestore] クライアント初期化失敗: {type(e).__name__}: {e}")
+            raise RuntimeError(
+                "Firestoreの認証に失敗しました。GOOGLE_CLOUD_PROJECT_IDと"
+                "GOOGLE_APPLICATION_CREDENTIALS_JSON（または認証ファイル設定）を確認してください。"
+            ) from e
         
         # コレクション名
         self.CONVERSATIONS = 'conversations'

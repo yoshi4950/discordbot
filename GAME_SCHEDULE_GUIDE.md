@@ -16,7 +16,7 @@ Steam APIの`GetOwnedGames`は、ユーザーの所有ゲーム/ゲーム詳細�
 
 募集カードを投稿するチャンネルでは、Botに「チャンネルを見る」「メッセージを送信」「埋め込みリンク」が必要です。タグ選択時にロールメンバーを初期表示するため、Developer PortalのServer Members Intentとコード上のmembers intentも必要です。`/game-tag-add` と `/sync` には「ロールの管理」権限およびロール階層の設定も必要です。
 
-Firestoreの接続設定は既存Botと共通です。`GOOGLE_CLOUD_PROJECT_ID` と `GOOGLE_APPLICATION_CREDENTIALS` または `GOOGLE_APPLICATION_CREDENTIALS_JSON` を使用し、既存のサービスアカウント権限でデータを書き込みます。
+Firestoreの接続設定は既存Botと共通です。`GOOGLE_CLOUD_PROJECT_ID` と、KoyebではサービスアカウントJSON全体を設定した `GOOGLE_APPLICATION_CREDENTIALS_JSON` を使用します。この変数があればJSONから直接認証し、未設定の場合はローカルの `GOOGLE_APPLICATION_CREDENTIALS` ファイルまたはADCを使用します。認証JSONはログに出さないでください。
 
 ## コマンド
 
