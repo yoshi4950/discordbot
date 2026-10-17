@@ -1,5 +1,6 @@
 import os
 import json
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 from google.cloud import firestore
@@ -7,6 +8,54 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 from google.oauth2 import service_account
 import asyncio
 from functools import wraps
+
+
+def _parse_service_account_json(value: str) -> Dict[str, Any]:
+    """環境変数からサービスアカウントJSONを読み込む。秘密値は例外に含めない。"""
+    raw = value.strip()
+
+    # .envの1行をそのままKoyebの値に貼り付けたケースも受け付ける。
+    raw = re.sub(
+        r"^(?:export\s+)?GOOGLE_APPLICATION_CREDENTIALS_JSON\s*=\s*",
+        "",
+        raw,
+        count=1,
+    ).strip()
+    if raw[:5].casefold() == "json:":
+        raw = raw[5:].strip()
+    fence_match = re.fullmatch(r"```(?:json)?\s*([\s\S]*?)\s*```", raw, flags=re.IGNORECASE)
+    if fence_match:
+        raw = fence_match.group(1).strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] == "'":
+        raw = raw[1:-1].strip()
+    # JSONの外側の開始波括弧だけを付け忘れた場合を補正する。
+    # 添付ログの「Extra data at column 7」は `"type":` から始まる値で発生する。
+    if raw.startswith('"type"') and raw.rstrip().endswith("}"):
+        raw = "{" + raw
+
+    try:
+        parsed = json.loads(raw)
+        # JSON文字列として二重にエンコードされている場合を許容する。
+        if isinstance(parsed, str):
+            parsed = json.loads(parsed)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "GOOGLE_APPLICATION_CREDENTIALS_JSONの値が有効なJSONではありません "
+            f"（{exc.lineno}行目・{exc.colno}列目）。Koyebの値にはサービスアカウントJSON本体だけを設定してください。"
+        ) from exc
+
+    if not isinstance(parsed, dict):
+        raise ValueError("GOOGLE_APPLICATION_CREDENTIALS_JSONはJSONオブジェクトである必要があります。")
+    required_fields = ("type", "project_id", "private_key", "client_email", "token_uri")
+    missing_fields = [field for field in required_fields if not parsed.get(field)]
+    if missing_fields:
+        raise ValueError(
+            "GOOGLE_APPLICATION_CREDENTIALS_JSONにサービスアカウントJSONの必須項目がありません: "
+            + ", ".join(missing_fields)
+        )
+    if parsed.get("type") != "service_account":
+        raise ValueError("GOOGLE_APPLICATION_CREDENTIALS_JSONのtypeはservice_accountである必要があります。")
+    return parsed
 
 class FirestoreDatabase:
     def __init__(self):
@@ -23,15 +72,13 @@ class FirestoreDatabase:
         
         # KoyebなどではサービスアカウントJSONを環境変数から直接読み込む。
         # ローカルではJSON環境変数、認証ファイル、ADCの順で既存設定を利用する。
+        auth_email = None
+        credential_project_id = None
         try:
             if self.credentials_json:
-                try:
-                    credentials_info = json.loads(self.credentials_json)
-                except json.JSONDecodeError as exc:
-                    raise ValueError(
-                        "GOOGLE_APPLICATION_CREDENTIALS_JSONをJSONとして読み取れません。"
-                        "Koyebの環境変数にはサービスアカウントJSON全体を設定してください。"
-                    ) from exc
+                credentials_info = _parse_service_account_json(self.credentials_json)
+                auth_email = credentials_info.get('client_email')
+                credential_project_id = credentials_info.get('project_id')
                 credentials = service_account.Credentials.from_service_account_info(
                     credentials_info
                 )
@@ -43,6 +90,7 @@ class FirestoreDatabase:
                 credentials = service_account.Credentials.from_service_account_file(
                     self.credentials_path
                 )
+                auth_email = credentials.service_account_email
                 self.db = firestore.Client(
                     project=self.project_id,
                     credentials=credentials,
@@ -51,6 +99,13 @@ class FirestoreDatabase:
                 # Cloud Run等の実行環境やgcloud ADCを利用する場合
                 self.db = firestore.Client(project=self.project_id)
             print(f"[Firestore] クライアント初期化成功 (データベース: default)")
+            if auth_email:
+                print(f"[Firestore] 認証サービスアカウント: {auth_email}")
+            if credential_project_id and credential_project_id != self.project_id:
+                print(
+                    f"[Firestore] 注意: 認証JSONのproject_id ({credential_project_id}) と "
+                    f"接続先プロジェクト ({self.project_id}) が異なります。"
+                )
         except Exception as e:
             # 認証JSONや秘密鍵そのものをログへ出さない。
             print(f"[Firestore] クライアント初期化失敗: {type(e).__name__}: {e}")
