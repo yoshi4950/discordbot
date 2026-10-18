@@ -5,6 +5,20 @@ import asyncio
 from datetime import datetime, timedelta
 import os
 
+
+async def _send_temporary_followup(interaction: discord.Interaction, *, content=None, embed=None, delay: int = 5):
+    """完了通知を短時間だけ表示し、削除対象チャンネルに残さない。"""
+    message = await interaction.followup.send(content=content, embed=embed, wait=True)
+
+    async def remove_later():
+        await asyncio.sleep(delay)
+        try:
+            await message.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+    asyncio.create_task(remove_later())
+
 class AutoDelete(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -66,7 +80,7 @@ class AutoDelete(commands.Cog):
                 message_count += 1  # Botのメッセージも含める
 
             if message_count == 0:
-                await interaction.followup.send("📝 削除対象のメッセージが見つかりません。")
+                await _send_temporary_followup(interaction, content="📝 削除対象のメッセージが見つかりません。")
                 self.pending_delete = None
                 return
 
@@ -105,16 +119,16 @@ class AutoDelete(commands.Cog):
             )
             embed.add_field(name="削除されたメッセージ数", value=f"{deleted_count}件", inline=True)
             
-            await interaction.followup.send(embed=embed)
+            await _send_temporary_followup(interaction, embed=embed)
             
             # 確認待ち状態をクリア
             self.pending_delete = None
             
         except discord.Forbidden:
-            await interaction.followup.send("❌ メッセージの削除権限がありません。")
+            await _send_temporary_followup(interaction, content="❌ メッセージの削除権限がありません。")
             self.pending_delete = None
         except Exception as e:
-            await interaction.followup.send(f"❌ エラーが発生しました: {e}")
+            await _send_temporary_followup(interaction, content=f"❌ エラーが発生しました: {e}")
             self.pending_delete = None
 
     @app_commands.command(name='delete', description='指定した時間ごとにチャンネル内の全メッセージを繰り返し削除します（管理者のみ）')
@@ -318,20 +332,7 @@ class AutoDelete(commands.Cog):
                             except Exception as e:
                                 print(f"チャンネルトピック更新エラー: {e}")
                             
-                            # 削除完了メッセージを送信（削除後に送信）
-                            try:
-                                embed = discord.Embed(
-                                    title="🔄 自動削除完了",
-                                    description=f"**{channel.mention}** の自動削除が完了しました。",
-                                    color=discord.Color.green()
-                                )
-                                embed.add_field(name="削除されたメッセージ数", value=f"{deleted_count}件", inline=True)
-                                embed.add_field(name="次回削除予定時刻", value=f"<t:{int(next_delete_time.timestamp())}:F>", inline=True)
-                                embed.add_field(name="次回削除予定時刻（相対）", value=f"<t:{int(next_delete_time.timestamp())}:R>", inline=True)
-                                
-                                await channel.send(embed=embed)
-                            except Exception as e:
-                                print(f"削除完了メッセージ送信エラー: {e}")
+                            # 定刻実行時はチャンネルに通知を残さず、削除処理のみ行う。
                 
                 except Exception as e:
                     print(f"チャンネル {channel_id} のメッセージ削除中にエラー: {e}")

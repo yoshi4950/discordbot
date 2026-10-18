@@ -14,6 +14,7 @@ import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
+from discord.ext import tasks
 from google.cloud.firestore_v1.base_query import FieldFilter
 from google.cloud import firestore
 
@@ -25,6 +26,7 @@ USERS = "game_schedule_users"
 GAMES = "game_schedule_games"
 TAGS = "game_schedule_tags"
 SCHEDULES = "game_schedules"
+JST = timezone(timedelta(hours=9))
 
 
 def _db():
@@ -51,6 +53,78 @@ def _schedule_embed(data: dict) -> discord.Embed:
     embed.add_field(name="△ 未定・不確定", value=mentions("maybe_users"), inline=True)
     embed.add_field(name="× 参加無し", value=mentions("no_users"), inline=True)
     return embed
+
+
+def _scheduled_at(date_str: str) -> datetime:
+    """募集表示用の日付を、通知タスク用のUTC datetimeに変換する。"""
+    now = datetime.now(JST)
+    if date_str == "今すぐ":
+        return datetime.now(timezone.utc)
+    match = re.fullmatch(r"(\d{2})/(\d{2}) (\d{2}):(\d{2})", date_str)
+    if not match:
+        raise ValueError(f"募集日時の形式が不正です: {date_str}")
+    month, day, hour, minute = map(int, match.groups())
+    year = now.year
+    if hour == 24:
+        hour, minute = 0, 0
+        local = datetime(year, month, day, hour, minute, tzinfo=JST) + timedelta(days=1)
+    else:
+        local = datetime(year, month, day, hour, minute, tzinfo=JST)
+    if local <= now:
+        try:
+            local = local.replace(year=year + 1)
+        except ValueError:  # 2/29を次の年に移す場合
+            local = local.replace(year=year + 1, day=28)
+    return local.astimezone(timezone.utc)
+
+
+def _claim_due_schedule(message_id: str) -> dict | None:
+    ref = _db().collection(SCHEDULES).document(message_id)
+    transaction = _db().transaction()
+
+    @firestore.transactional
+    def claim(transaction):
+        snapshot = ref.get(transaction=transaction)
+        if not snapshot.exists:
+            return None
+        data = snapshot.to_dict()
+        due_at = data.get("scheduled_at")
+        if (data.get("deleted") or data.get("reminder_sent")
+                or data.get("reminder_claimed") or due_at is None):
+            return None
+        if due_at.tzinfo is None:
+            due_at = due_at.replace(tzinfo=timezone.utc)
+        if due_at > datetime.now(timezone.utc):
+            return None
+        transaction.update(ref, {"reminder_claimed": True})
+        return data
+
+    return claim(transaction)
+
+
+def _finish_schedule_reminder(message_id: str, sent: bool) -> None:
+    _db().collection(SCHEDULES).document(message_id).update({
+        "reminder_claimed": False,
+        "reminder_sent": sent,
+    })
+
+
+def _cancel_schedule(message_id: str, organizer_id: int) -> bool:
+    ref = _db().collection(SCHEDULES).document(message_id)
+    transaction = _db().transaction()
+
+    @firestore.transactional
+    def cancel(transaction):
+        snapshot = ref.get(transaction=transaction)
+        if not snapshot.exists:
+            return False
+        data = snapshot.to_dict()
+        if int(data.get("organizer_id", 0)) != organizer_id:
+            return False
+        transaction.update(ref, {"deleted": True, "reminder_sent": True, "reminder_claimed": False})
+        return True
+
+    return cancel(transaction)
 
 
 def _cast_vote(message_id: int, user_id: int, status: str) -> dict | None:
@@ -93,6 +167,27 @@ class ScheduleView(discord.ui.View):
             await interaction.response.send_message("この募集データは見つかりません。", ephemeral=True)
             return
         await interaction.response.edit_message(embed=_schedule_embed(data), view=self)
+
+    @discord.ui.button(label="募集を削除", style=discord.ButtonStyle.danger,
+                       custom_id="game_schedule:delete", row=1)
+    async def delete_schedule(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        try:
+            deleted = await asyncio.to_thread(
+                _cancel_schedule, str(interaction.message.id), interaction.user.id
+            )
+        except Exception as exc:
+            print(f"[GameSchedule] 募集削除処理エラー: {type(exc).__name__}: {exc}")
+            await interaction.response.send_message("募集を削除できませんでした。", ephemeral=True)
+            return
+        if not deleted:
+            await interaction.response.send_message("募集の主催者のみ削除できます。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await interaction.message.delete()
+        except discord.HTTPException as exc:
+            print(f"[GameSchedule] 募集カード削除エラー: {exc}")
+        await interaction.followup.send("募集を削除しました。通知もキャンセルされました。", ephemeral=True)
 
     @discord.ui.button(label="参加 (〇)", style=discord.ButtonStyle.success, custom_id="game_schedule:yes")
     async def yes(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -139,6 +234,10 @@ class RecruitModal(discord.ui.Modal, title="募集内容を入力"):
             "organizer_id": interaction.user.id,
             "game_name": self.game_name,
             "date_str": self.date_str,
+            "scheduled_at": _scheduled_at(self.date_str),
+            "reminder_sent": False,
+            "reminder_claimed": False,
+            "deleted": False,
             "mention_mode": self.mention_mode,
             "role_id": self.role_id,
             "memo": str(self.memo.value),
@@ -250,7 +349,7 @@ class DatePartSelect(discord.ui.Select):
 
 
 class RecruitDateView(discord.ui.View):
-    """月日を選ぶ段階。31日分は選択肢上限に合わせて範囲を切り替える。"""
+    """月日を選ぶ段階。日付選択肢を01〜15日と16〜31日に分ける。"""
 
     def __init__(self, cog: "GameSchedule", tags: list[dict]) -> None:
         super().__init__(timeout=300)
@@ -259,7 +358,7 @@ class RecruitDateView(discord.ui.View):
         japan_tz = timezone(timedelta(hours=9))
         now = datetime.now(japan_tz)
         self.year, self.month, self.day = now.year, now.month, now.day
-        self.day_page = 1 if self.day <= 25 else 2
+        self.day_page = 1 if self.day <= 15 else 2
         self.hour, self.minute = 21, 0
         self.cog = cog
         self.tags = tags
@@ -282,20 +381,20 @@ class RecruitDateView(discord.ui.View):
 
     def make_day_options(self) -> list[discord.SelectOption]:
         max_day = calendar.monthrange(self.year, self.month)[1]
-        start = 1 if self.day_page == 1 else 26
-        end = min(25, max_day) if self.day_page == 1 else max_day
+        start = 1 if self.day_page == 1 else 16
+        end = min(15, max_day) if self.day_page == 1 else max_day
         return [discord.SelectOption(label=f"{day:02d}日", value=str(day), default=(day == self.day))
                 for day in range(start, end + 1)]
 
     def update_day_options(self, reset_day: bool = False) -> None:
         max_day = calendar.monthrange(self.year, self.month)[1]
         self.day = min(self.day, max_day)
-        if self.day > 25:
+        if self.day > 15:
             self.day_page = 2
-        elif self.day_page == 2 and max_day < 26:
+        elif self.day_page == 2 and max_day < 16:
             self.day_page = 1
         if reset_day:
-            self.day = 1 if self.day_page == 1 else 26
+            self.day = 1 if self.day_page == 1 else 16
         self.remove_item(self.day_select)
         self.day_select = DatePartSelect(self, "day", self.make_day_options(), 1, "DD（日）を選択")
         self.add_item(self.day_select)
@@ -305,11 +404,11 @@ class RecruitDateView(discord.ui.View):
         self.update_day_options(reset_day=True)
         await interaction.response.edit_message(content=self.prompt(), view=self)
 
-    @discord.ui.button(label="DD 01〜25", style=discord.ButtonStyle.secondary, row=4)
+    @discord.ui.button(label="DD 01〜15", style=discord.ButtonStyle.secondary, row=4)
     async def first_day_range(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.set_day_page(interaction, 1)
 
-    @discord.ui.button(label="DD 26〜31", style=discord.ButtonStyle.secondary, row=4)
+    @discord.ui.button(label="DD 16〜31", style=discord.ButtonStyle.secondary, row=4)
     async def second_day_range(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.set_day_page(interaction, 2)
 
@@ -1030,6 +1129,56 @@ class GameSchedule(commands.Cog):
         self.bot.add_view(self.view)
         self.bot.add_view(TagPanelView(self))
         self.bot.add_view(LegacyTagPanelUpdateView(self))
+        self.check_schedule_reminders.start()
+
+    def cog_unload(self) -> None:
+        self.check_schedule_reminders.cancel()
+
+    @tasks.loop(seconds=30)
+    async def check_schedule_reminders(self) -> None:
+        """Firestore内の期限到来募集を確認し、参加確定者へ一度だけ通知する。"""
+        try:
+            docs = await asyncio.to_thread(lambda: list(_db().collection(SCHEDULES).stream()))
+        except Exception as exc:
+            print(f"[GameSchedule] 募集通知一覧取得エラー: {type(exc).__name__}: {exc}")
+            return
+        for doc in docs:
+            try:
+                data = await asyncio.to_thread(_claim_due_schedule, doc.id)
+                if data is None:
+                    continue
+                channel = self.bot.get_channel(int(data["channel_id"]))
+                users = [int(user_id) for user_id in data.get("yes_users", [])]
+                if channel is None:
+                    channel = await self.bot.fetch_channel(int(data["channel_id"]))
+                if users:
+                    text = f"{data.get('game_name', 'ゲーム')}の時間になったよ！ " + " ".join(
+                        f"<@{user_id}>" for user_id in users
+                    )
+                    await channel.send(
+                        text,
+                        allowed_mentions=discord.AllowedMentions(
+                            users=[discord.Object(id=user_id) for user_id in users],
+                            roles=False, everyone=False,
+                        ),
+                    )
+                await asyncio.to_thread(_finish_schedule_reminder, doc.id, True)
+            except discord.NotFound:
+                # チャンネルが消えていても重複処理を避けるため通知済みとして閉じる。
+                try:
+                    await asyncio.to_thread(_finish_schedule_reminder, doc.id, True)
+                except Exception:
+                    pass
+            except Exception as exc:
+                print(f"[GameSchedule] 募集期限通知エラー (message_id={doc.id}): {type(exc).__name__}: {exc}")
+                try:
+                    await asyncio.to_thread(_finish_schedule_reminder, doc.id, False)
+                except Exception as reset_exc:
+                    print(f"[GameSchedule] 通知再試行状態の保存エラー: {reset_exc}")
+
+    @check_schedule_reminders.before_loop
+    async def before_schedule_reminders(self) -> None:
+        await self.bot.wait_until_ready()
 
     async def get_guild_tags(self, guild_id: int, visible_only: bool = True) -> list[dict]:
         docs = await asyncio.to_thread(
