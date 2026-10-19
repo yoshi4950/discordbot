@@ -89,24 +89,37 @@ def _claim_due_schedule(message_id: str) -> dict | None:
             return None
         data = snapshot.to_dict()
         due_at = data.get("scheduled_at")
-        if (data.get("deleted") or data.get("reminder_sent")
-                or data.get("reminder_claimed") or due_at is None):
+        if data.get("deleted") or data.get("reminder_sent"):
+            # 旧バージョンで通知済みのまま期限が残っているデータを検索対象から外す。
+            transaction.update(ref, {"scheduled_at": None, "reminder_claimed": False})
+            return None
+        if due_at is None:
             return None
         if due_at.tzinfo is None:
             due_at = due_at.replace(tzinfo=timezone.utc)
         if due_at > datetime.now(timezone.utc):
             return None
-        transaction.update(ref, {"reminder_claimed": True})
+        claimed_at = data.get("reminder_claimed_at")
+        if data.get("reminder_claimed") and claimed_at is not None:
+            if claimed_at.tzinfo is None:
+                claimed_at = claimed_at.replace(tzinfo=timezone.utc)
+            if claimed_at > datetime.now(timezone.utc) - timedelta(minutes=5):
+                return None
+        transaction.update(ref, {
+            "reminder_claimed": True,
+            "reminder_claimed_at": datetime.now(timezone.utc),
+        })
         return data
 
     return claim(transaction)
 
 
 def _finish_schedule_reminder(message_id: str, sent: bool) -> None:
-    _db().collection(SCHEDULES).document(message_id).update({
-        "reminder_claimed": False,
-        "reminder_sent": sent,
-    })
+    update = {"reminder_claimed": False, "reminder_claimed_at": None, "reminder_sent": sent}
+    if sent:
+        # 通知済み募集を期限検索の対象から外し、以後の読み取りを抑える。
+        update["scheduled_at"] = None
+    _db().collection(SCHEDULES).document(message_id).update(update)
 
 
 def _cancel_schedule(message_id: str, organizer_id: int) -> bool:
@@ -121,7 +134,13 @@ def _cancel_schedule(message_id: str, organizer_id: int) -> bool:
         data = snapshot.to_dict()
         if int(data.get("organizer_id", 0)) != organizer_id:
             return False
-        transaction.update(ref, {"deleted": True, "reminder_sent": True, "reminder_claimed": False})
+        transaction.update(ref, {
+            "deleted": True,
+            "reminder_sent": True,
+            "reminder_claimed": False,
+            "reminder_claimed_at": None,
+            "scheduled_at": None,
+        })
         return True
 
     return cancel(transaction)
@@ -1124,6 +1143,7 @@ class GameSchedule(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self.view = ScheduleView()
+        self._reminder_retry_delay = 0
 
     async def cog_load(self) -> None:
         self.bot.add_view(self.view)
@@ -1134,14 +1154,24 @@ class GameSchedule(commands.Cog):
     def cog_unload(self) -> None:
         self.check_schedule_reminders.cancel()
 
-    @tasks.loop(seconds=30)
+    @tasks.loop(seconds=60)
     async def check_schedule_reminders(self) -> None:
         """Firestore内の期限到来募集を確認し、参加確定者へ一度だけ通知する。"""
         try:
-            docs = await asyncio.to_thread(lambda: list(_db().collection(SCHEDULES).stream()))
+            now = datetime.now(timezone.utc)
+            due_query = _db().collection(SCHEDULES).where(
+                filter=FieldFilter("scheduled_at", "<=", now)
+            )
+            docs = await asyncio.to_thread(lambda: list(due_query.stream()))
         except Exception as exc:
-            print(f"[GameSchedule] 募集通知一覧取得エラー: {type(exc).__name__}: {exc}")
+            self._reminder_retry_delay = min(max(self._reminder_retry_delay * 2, 60), 900)
+            print(
+                f"[GameSchedule] 募集通知一覧取得エラー: {type(exc).__name__}: {exc}。"
+                f"{self._reminder_retry_delay}秒後に再試行します。"
+            )
+            await asyncio.sleep(self._reminder_retry_delay)
             return
+        self._reminder_retry_delay = 0
         for doc in docs:
             try:
                 data = await asyncio.to_thread(_claim_due_schedule, doc.id)
